@@ -19,6 +19,7 @@ import glob
 import psutil
 import winreg
 import traceback
+import ipaddress
 from datetime import datetime, timedelta
 
 # Setup early logging to capture startup issues
@@ -80,7 +81,7 @@ try:
         if startup_logger:
             startup_logger.info("Importing GUI modules...")
         import tkinter as tk
-        from tkinter import ttk
+        from tkinter import ttk, messagebox
         if startup_logger:
             startup_logger.info("GUI modules imported successfully")
     except ImportError as e:
@@ -706,11 +707,113 @@ class PrinterOneServer:
             
             # Method 4: Last resort - return localhost
             return '127.0.0.1'
-            
         except Exception as e:
             if startup_logger:
                 startup_logger.error(f"Error getting local IP: {e}")
             return '127.0.0.1'
+
+    @staticmethod
+    def get_primary_network_config():
+        """Return the active Windows IPv4 interface and its current network settings."""
+        script = r'''
+$items = @(Get-NetIPConfiguration | Where-Object { $_.IPv4Address -and $_.IPv4DefaultGateway } | ForEach-Object {
+  $interface = $_
+  $dns = @(Get-DnsClientServerAddress -InterfaceIndex $interface.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ })
+  $dhcp = (Get-NetIPInterface -InterfaceIndex $interface.InterfaceIndex -AddressFamily IPv4).Dhcp -eq 'Enabled'
+  [pscustomobject]@{ Name=$interface.InterfaceAlias; Index=$interface.InterfaceIndex; IP=$interface.IPv4Address[0].IPAddress; Prefix=$interface.IPv4Address[0].PrefixLength; Gateway=$interface.IPv4DefaultGateway[0].NextHop; DNS=$dns; DHCP=$dhcp }
+})
+if ($items.Count -gt 0) { $items[0] | ConvertTo-Json -Compress -Depth 3 }
+'''
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            raise RuntimeError(result.stderr.strip() or "No active IPv4 interface with a default gateway was found.")
+        config = json.loads(result.stdout.strip())
+        if isinstance(config.get("DNS"), str):
+            config["DNS"] = [config["DNS"]]
+        return config
+
+    @staticmethod
+    def is_ip_in_use(ip_address):
+        """Probe an IPv4 address and check the Windows neighbor table for a response."""
+        parsed_address = ipaddress.IPv4Address(ip_address)
+        if parsed_address.is_loopback or parsed_address.is_multicast or parsed_address.is_unspecified:
+            raise ValueError("Please enter a usable unicast host IP address.")
+        address = str(parsed_address)
+        subprocess.run(
+            ["ping.exe", "-n", "1", "-w", "800", address],
+            capture_output=True, text=True, timeout=3,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        script = f"$n=Get-NetNeighbor -IPAddress '{address}' -ErrorAction SilentlyContinue | Where-Object {{ $_.State -notin @('Unreachable','Incomplete') }} | Select-Object -First 1; if ($n) {{ $n.LinkLayerAddress }}"
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        return bool(result.stdout.strip())
+
+    @staticmethod
+    def set_static_ipv4(config, address):
+        """Request elevation and configure the selected adapter with a static IPv4 address."""
+        address = ipaddress.IPv4Address(address)
+        network = ipaddress.IPv4Network(f"{config['IP']}/{config['Prefix']}", strict=False)
+        if address not in network or address in (network.network_address, network.broadcast_address):
+            raise ValueError(f"IP must be a usable address in {network}.")
+        if address == ipaddress.IPv4Address(config["Gateway"]):
+            raise ValueError("IP address cannot be the default gateway.")
+
+        dns = config.get("DNS") or [config["Gateway"]]
+        dns_args = ",".join("'" + str(ipaddress.IPv4Address(value)) + "'" for value in dns)
+        old_ip = ipaddress.IPv4Address(config["IP"])
+        old_gateway = ipaddress.IPv4Address(config["Gateway"])
+        old_prefix = int(config["Prefix"])
+        was_dhcp = "$true" if config.get("DHCP", False) else "$false"
+        script = f"""
+$ErrorActionPreference = 'Stop'
+$interfaceIndex = {int(config['Index'])}
+$previouslyUsedDhcp = {was_dhcp}
+$previousIp = '{old_ip}'
+$previousPrefix = {old_prefix}
+$previousGateway = '{old_gateway}'
+$previousDns = @({dns_args})
+try {{
+  Set-NetIPInterface -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -Dhcp Disabled
+  Get-NetIPAddress -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -ne '127.0.0.1' }} | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+  New-NetIPAddress -InterfaceIndex $interfaceIndex -IPAddress '{address}' -PrefixLength {int(config['Prefix'])} -DefaultGateway '{config['Gateway']}' | Out-Null
+  Set-DnsClientServerAddress -InterfaceIndex $interfaceIndex -ServerAddresses @({dns_args})
+  $newAddress = Get-NetIPAddress -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -IPAddress '{address}' -ErrorAction SilentlyContinue
+  if (-not $newAddress) {{ throw 'Windows did not retain the requested IP address.' }}
+  exit 0
+}} catch {{
+  $applyError = $_.Exception.Message
+  $restoreError = $null
+  try {{
+    Get-NetIPAddress -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -ne '127.0.0.1' }} | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+    if ($previouslyUsedDhcp) {{ Set-NetIPInterface -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -Dhcp Enabled }}
+    else {{
+      Set-NetIPInterface -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -Dhcp Disabled
+      New-NetIPAddress -InterfaceIndex $interfaceIndex -IPAddress $previousIp -PrefixLength $previousPrefix -DefaultGateway $previousGateway | Out-Null
+    }}
+    if ($previousDns.Count -gt 0) {{ Set-DnsClientServerAddress -InterfaceIndex $interfaceIndex -ServerAddresses $previousDns }}
+    else {{ Set-DnsClientServerAddress -InterfaceIndex $interfaceIndex -ResetServerAddresses }}
+  }} catch {{ $restoreError = $_.Exception.Message }}
+  if ($restoreError) {{ [Console]::Error.WriteLine('Apply failed: ' + $applyError + '; automatic restore also failed: ' + $restoreError) }}
+  else {{ [Console]::Error.WriteLine('Apply failed: ' + $applyError + '; previous network settings were restored.') }}
+  exit 1
+}}
+"""
+        encoded = __import__('base64').b64encode(script.encode('utf-16le')).decode('ascii')
+        command = f"Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','{encoded}') | ForEach-Object {{ exit $_.ExitCode }}"
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, timeout=90,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "Windows could not apply the static IP configuration.")
     
     def start_server(self):
         """Start the TCP print server"""
@@ -978,6 +1081,19 @@ class PrinterOneGUI:
             self.port_var = tk.IntVar(value=self.server.config.get("port", 9100))
             self.test_host_var = tk.StringVar(value="localhost")
             self.test_port_var = tk.IntVar(value=9100)
+            self.network_config = None
+            self.static_ip_var = tk.StringVar()
+            try:
+                self.network_config = self.server.get_primary_network_config()
+                current_ip = ipaddress.IPv4Address(self.network_config["IP"])
+                suggested = ipaddress.IPv4Address(f"{'.'.join(str(current_ip).split('.')[:3])}.199")
+                subnet = ipaddress.IPv4Network(f"{current_ip}/{self.network_config['Prefix']}", strict=False)
+                if suggested not in subnet or suggested in (subnet.network_address, subnet.broadcast_address):
+                    suggested = subnet.network_address + min(199, max(1, subnet.num_addresses - 2))
+                self.static_ip_var.set(str(suggested))
+            except Exception as network_error:
+                if self.init_logger:
+                    self.init_logger.warning(f"Could not inspect primary network: {network_error}")
             
             # System tray variables
             self.tray_icon = None
@@ -1280,6 +1396,24 @@ Test results will appear here...
     
     def create_settings_tab(self, parent):
         """Create settings tab"""
+        network_frame = ttk.LabelFrame(parent, text="Static IPv4 Address", padding="10")
+        network_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        if self.network_config:
+            config = self.network_config
+            current_network = ipaddress.IPv4Network(f"{config['IP']}/{config['Prefix']}", strict=False)
+            ttk.Label(network_frame, text=f"Adapter: {config['Name']}  |  Current IP: {config['IP']}/{config['Prefix']}  |  Gateway: {config['Gateway']}").pack(anchor=tk.W, pady=(0, 6))
+            ttk.Label(network_frame, text=f"Subnet: {current_network}   Suggested: {self.static_ip_var.get()}").pack(anchor=tk.W, pady=(0, 8))
+            address_row = ttk.Frame(network_frame)
+            address_row.pack(fill=tk.X)
+            ttk.Label(address_row, text="IP address:").pack(side=tk.LEFT)
+            ttk.Entry(address_row, textvariable=self.static_ip_var, width=18).pack(side=tk.LEFT, padx=8)
+            ttk.Button(address_row, text="Check IP", command=self.check_static_ip).pack(side=tk.LEFT, padx=4)
+            ttk.Button(address_row, text="Apply Static IP", command=self.apply_static_ip).pack(side=tk.LEFT, padx=4)
+            ttk.Label(network_frame, text="Applying this changes Windows network settings and may briefly disconnect this computer. Administrator access is required.", foreground="gray", wraplength=900).pack(anchor=tk.W, pady=(8, 0))
+        else:
+            ttk.Label(network_frame, text="No active IPv4 adapter with a default gateway was found. Connect to a network and restart PrinterOne.").pack(anchor=tk.W)
+
         # Application settings
         app_frame = ttk.LabelFrame(parent, text="Application Settings", padding="10")
         app_frame.pack(fill=tk.X, padx=10, pady=10)
@@ -1309,6 +1443,50 @@ A simple TCP server that receives raw print data and sends it directly to a loca
 Includes a GUI management interface and test client with PDF conversion for testing."""
         
         ttk.Label(about_frame, text=about_text, justify=tk.LEFT, font=("Arial", 9)).pack(anchor=tk.W)
+
+    def check_static_ip(self):
+        """Check whether the selected IPv4 address responds on the local network."""
+        try:
+            parsed_address = ipaddress.IPv4Address(self.static_ip_var.get().strip())
+            address = str(parsed_address)
+            network = ipaddress.IPv4Network(f"{self.network_config['IP']}/{self.network_config['Prefix']}", strict=False)
+            if parsed_address not in network or parsed_address in (network.network_address, network.broadcast_address):
+                raise ValueError(f"Enter a usable IP in {network}.")
+            if address == self.network_config["Gateway"]:
+                raise ValueError("IP address cannot be the default gateway.")
+            in_use = self.server.is_ip_in_use(address)
+            if in_use:
+                messagebox.showwarning("IP address in use", f"{address} responded on the network or appears in the neighbor table. Choose another address.")
+                self.log_message(f"[IP] {address} appears to be in use")
+            else:
+                messagebox.showinfo("IP check", f"No device responded at {address}. This is only a network probe; it cannot guarantee the address is reserved.")
+                self.log_message(f"[IP] No response detected for {address}")
+        except Exception as error:
+            messagebox.showerror("IP check failed", str(error))
+
+    def apply_static_ip(self):
+        """Apply the selected static IP after validating that it appears unused."""
+        try:
+            parsed_address = ipaddress.IPv4Address(self.static_ip_var.get().strip())
+            address = str(parsed_address)
+            network = ipaddress.IPv4Network(f"{self.network_config['IP']}/{self.network_config['Prefix']}", strict=False)
+            if parsed_address not in network or parsed_address in (network.network_address, network.broadcast_address):
+                raise ValueError(f"Enter a usable IP in {network}.")
+            if address == self.network_config["Gateway"]:
+                raise ValueError("IP address cannot be the default gateway.")
+            if self.server.is_ip_in_use(address):
+                raise ValueError(f"{address} appears to be in use. Choose another address.")
+            if not messagebox.askyesno(
+                "Apply static IP?",
+                f"Set {self.network_config['Name']} to {address}/{self.network_config['Prefix']}?\n\nGateway and DNS will be preserved. The network may disconnect briefly and Windows will request Administrator permission."
+            ):
+                return
+            self.server.set_static_ipv4(self.network_config, address)
+            messagebox.showinfo("Static IP applied", f"Windows accepted the request to set {address}. Restart the server if clients do not reconnect.")
+            self.log_message(f"[IP] Requested static address {address} on {self.network_config['Name']}")
+        except Exception as error:
+            messagebox.showerror("Could not apply static IP", str(error))
+            self.log_message(f"[IP] Failed to apply static IP: {error}")
     
     def log_test_message(self, message):
         """Add message to test log"""

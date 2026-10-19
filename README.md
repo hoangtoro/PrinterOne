@@ -26,6 +26,7 @@ A comprehensive TCP network print server with integrated GUI management and syst
 - ⚙️ **Configuration Management** - Persistent settings stored in JSON format
 - 🔥 **Port Management** - Automatic port conflict resolution
 - 🌐 **Network Discovery** - Shows local IP addresses for easy client configuration
+- 📌 **Static IPv4 Setup** - Check a proposed IP address and configure a Windows network adapter with a fixed address
 
 ## 🎯 Use Cases
 
@@ -128,6 +129,10 @@ The application uses `config.json` for persistent settings:
 Once the server is running, other machines can send print jobs to:
 ```
 YOUR_IP_ADDRESS:9100
+
+### Set a static IP
+
+Open **Settings → Static IPv4 Address** to review the primary adapter's current address, gateway, subnet, and suggested address (the current `/24` address with its last octet set to `.199`). Use **Check IP** before applying. A quiet probe cannot guarantee an address is reserved, so choose an address outside the router's DHCP pool or create a DHCP reservation when possible. **Apply Static IP** asks Windows for Administrator permission and preserves the current gateway, subnet mask, and DNS servers. The network may briefly disconnect while Windows applies the change.
 ```
 
 Example using netcat:
